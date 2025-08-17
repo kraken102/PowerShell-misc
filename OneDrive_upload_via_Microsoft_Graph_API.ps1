@@ -1,14 +1,15 @@
 # ---------------------------------------
 # OneDrive upload via Microsoft Graph (ID-based, resilient, HttpClient PUT)
-# - Lean auth module only
-# - 10MB chunks, Int64-safe
-# - Retries + resume on network hiccups
-# - Uses HttpClient for PUT (so we can set ConnectionClose cleanly)
+# - Works for very large files (e.g., 15+ GB)
+# - Chunks snap to 320 KiB grid (Graph requirement)
+# - Retries + resume from server's nextExpectedRanges
+# - Forces conflictBehavior=replace
+# - Prints final webUrl and verifies by path
 # ---------------------------------------
 
 # ==== EDIT THESE ====
-$LocalPath    = "C:\*\backup.rar"                      # local file
-$OneDrivePath = "Backup\backup.rar"                    # OneDrive target path (slashes normalized)
+$LocalPath    = "C:\*\Backup.rar"       # local file
+$OneDrivePath = "Backups\backup.rar"    # OneDrive target path (slashes normalized)
 
 # ==== Safety / logging ====
 $ErrorActionPreference = 'Stop'
@@ -18,17 +19,18 @@ $VerbosePreference     = 'Continue'
 [System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 [System.Net.ServicePointManager]::Expect100Continue = $false
 
-# Use only the tiny auth module to avoid ISE function-cap limits
+# ---- Modules (ensure fresh Invoke-MgGraphRequest) ----
 Get-Module Microsoft.Graph* | Remove-Module -Force -ErrorAction SilentlyContinue
+try { Install-Module Microsoft.Graph.Authentication -Force -Scope CurrentUser -ErrorAction Stop } catch {}
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
-# ---- HttpClient (for stable PUTs + ConnectionClose) ----
+# ---- HttpClient (for stable PUTs + Connection: close) ----
 if (-not $script:HttpClient) {
   $script:HttpHandler = [System.Net.Http.HttpClientHandler]::new()
   $script:HttpClient  = [System.Net.Http.HttpClient]::new($script:HttpHandler)
   $script:HttpClient.Timeout = [TimeSpan]::FromMinutes(30)
   $script:HttpClient.DefaultRequestHeaders.ExpectContinue = $false
-  $script:HttpClient.DefaultRequestHeaders.UserAgent.ParseAdd("PS-OneDriveUploader/1.2")
+  $script:HttpClient.DefaultRequestHeaders.UserAgent.ParseAdd("PS-OneDriveUploader/1.3")
 }
 
 function Ensure-GraphConnection {
@@ -58,7 +60,6 @@ function Ensure-OneDriveFolderPath {
   if ([string]::IsNullOrWhiteSpace($FolderPath)) { return "root" }
   $parentId = "root"
   foreach($seg in ($FolderPath.Split('/') | Where-Object { $_ })) {
-    # Fetch children and filter locally (avoid OData $filter with user input)
     $url = "https://graph.microsoft.com/v1.0/me/drive/items/$($parentId)/children?`$select=id,name,folder"
     $res = Invoke-MgGraphRequest -Method GET -Uri $url
     $found = $res.value | Where-Object { $_.name -eq $seg -and $_.folder }
@@ -70,6 +71,12 @@ function Ensure-OneDriveFolderPath {
     $parentId = $created.id
   }
   return $parentId
+}
+
+# Snap a size to the nearest LOWER multiple of 320 KiB (327,680 bytes)
+function Snap-ToGraphGrid([Int64]$size){
+  $grid = 327680
+  return [int64]([math]::Floor($size / $grid) * $grid)
 }
 
 function Get-SessionResumeStart {
@@ -101,23 +108,29 @@ function Upload-LargeFile {
   )
 
   Write-Verbose "Creating upload session: $SessionUrl"
-  $session = Invoke-MgGraphRequest -Method POST -Uri $SessionUrl -Body (@{} | ConvertTo-Json) -ContentType "application/json"
+  # Force predictable conflict behavior: replace target if it exists
+  $sessionBody = @{ item = @{ "@microsoft.graph.conflictBehavior" = "replace" } } | ConvertTo-Json
+  $session = Invoke-MgGraphRequest -Method POST -Uri $SessionUrl -Body $sessionBody -ContentType "application/json"
   $uploadUrl = $session.uploadUrl
   if (-not $uploadUrl) { throw "Failed to create upload session." }
 
   $fs = [System.IO.File]::OpenRead($LocalFile)
   try {
-    [Int64]$chunkSize = 10MB
-    [Int64]$minChunk  = 2MB
+    # Base chunk = 20 MB (64 * 320 KiB). Min chunk = 8 * 320 KiB.
+    [Int64]$chunkSize = Snap-ToGraphGrid 20MB
+    [Int64]$minChunk  = 2560KB
     [Int64]$total     = $fs.Length
     [Int64]$start     = 0
 
     while ($start -lt $total) {
       $fs.Position = $start
       [Int64]$remaining = $total - $start
-      [Int64]$thisSize  = if ($remaining -lt $chunkSize) { $remaining } else { $chunkSize }
 
-      # byte[] must be Int32
+      # For all but last chunk, keep size on the 320 KiB grid
+      [Int64]$thisSize  = if ($remaining -lt $chunkSize) { $remaining } else { $chunkSize }
+      if ($remaining -gt $chunkSize) { $thisSize = Snap-ToGraphGrid $thisSize }
+
+      # byte[] must be Int32 length
       $buffer = New-Object byte[] ([int]$thisSize)
       $read   = $fs.Read($buffer, 0, $buffer.Length)
       if ($read -le 0) { break }
@@ -127,13 +140,12 @@ function Upload-LargeFile {
       # Progress
       $percent = [int](($end + 1) * 100 / $total)
       Write-Progress -Activity "Uploading to OneDrive" -Status "$percent% ($start-$end)" -PercentComplete $percent
-      Write-Verbose ("PUT chunk {0:n0}-{1:n0} of {2:n0}" -f $start, $end, $total)
+      Write-Verbose ("PUT chunk {0:n0}-{1:n0} of {2:n0} (size {3:n0})" -f $start, $end, $total, $read)
 
       $maxRetries = 6
       $attempt = 0
       while ($true) {
         try {
-          # Build HTTP PUT with Connection: close
           $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Put, $uploadUrl)
           $req.Headers.ConnectionClose = $true
 
@@ -144,14 +156,47 @@ function Upload-LargeFile {
 
           $resp   = $script:HttpClient.SendAsync($req).GetAwaiter().GetResult()
           $status = [int]$resp.StatusCode
+          $body   = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
           $resp.Dispose()
 
-          if ($status -in 200,201) { Write-Verbose "Upload complete." }
-          # 200/201 finished, 202 continue
-          $start = $end + 1
-          break
+          if ($status -in 200,201) {
+            Write-Verbose "Upload complete."
+            if ($body) {
+              try {
+                $item = $body | ConvertFrom-Json
+                if ($item.webUrl) {
+                  Write-Host "✅ Final item: $($item.name)" -ForegroundColor Green
+                  Write-Host "🔗 $($item.webUrl)" -ForegroundColor Cyan
+                }
+              } catch {}
+            }
+            $start = $end + 1
+            break
+          }
+          elseif ($status -eq 202) {
+            # In-progress response; honor server's nextExpectedRanges if present
+            if ($body) {
+              try {
+                $j = $body | ConvertFrom-Json
+                if ($j.nextExpectedRanges -and $j.nextExpectedRanges.Count -gt 0) {
+                  $nextStart = [int64](($j.nextExpectedRanges[0] -split '-')[0])
+                  if ($nextStart -gt $start) {
+                    Write-Verbose "Server suggests next start at $nextStart; resyncing."
+                    $start = $nextStart
+                    break # break retry loop to rebuild buffer
+                  }
+                }
+              } catch {}
+            }
+            # If no hint, proceed sequentially
+            $start = $end + 1
+            break
+          }
+          else {
+            throw "Unexpected status $status`n$body"
+          }
         }
-        catch [System.IO.IOException],[System.Net.WebException],[System.Net.Http.HttpRequestException],[System.Threading.Tasks.TaskCanceledException] {
+        catch [System.IO.IOException],[System.Net.WebException],[System.Net.Http.HttpRequestException],[System.Threading.Tasks.TaskCanceledException],[System.Exception] {
           $attempt++
           Write-Warning ("Chunk {0}-{1} failed (attempt {2}/{3}): {4}" -f $start,$end,$attempt,$maxRetries,$_.Exception.Message)
           if ($attempt -ge $maxRetries) { throw }
@@ -164,10 +209,11 @@ function Upload-LargeFile {
             break  # break retry loop to rebuild buffer for new $start
           }
 
-          # After a few misses, shrink chunk size for stability (down to 2MB)
+          # After a few misses, shrink chunk size for stability (down to minChunk) and snap to grid
           if ($attempt -ge 3 -and $chunkSize -gt $minChunk) {
             $chunkSize = [Int64]([Math]::Max($minChunk, [int64]($chunkSize / 2)))
-            Write-Verbose "Reducing chunk size to $chunkSize bytes."
+            $chunkSize = Snap-ToGraphGrid $chunkSize
+            Write-Verbose "Reducing chunk size to $chunkSize bytes (320 KiB aligned)."
           }
 
           # Exponential backoff (1,2,4,8,16,32s; cap at 60)
@@ -191,7 +237,6 @@ function Upload-SmallFile {
   Write-Verbose "Uploading small file to $ContentUrl"
   $bytes = [System.IO.File]::ReadAllBytes($LocalFile)
 
-  # Small PUT with HttpClient too (consistency)
   $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Put, $ContentUrl)
   $req.Headers.ConnectionClose = $true
   $content = [System.Net.Http.ByteArrayContent]::new($bytes)
@@ -199,13 +244,14 @@ function Upload-SmallFile {
   $req.Content = $content
   $resp = $script:HttpClient.SendAsync($req).GetAwaiter().GetResult()
   $status = [int]$resp.StatusCode
+  $body   = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
   $resp.Dispose()
-  if ($status -notin 200,201) { throw "Small upload failed with status $status" }
+  if ($status -notin 200,201) { throw "Small upload failed with status $status`n$body" }
 }
 
 # ===== Main =====
 if (-not (Test-Path -LiteralPath $LocalPath)) { throw "Local file not found: $LocalPath" }
-Ensure-GraphConnection -Scopes @("Files.ReadWrite")   # least-priv for personal OneDrive
+Ensure-GraphConnection -Scopes @("Files.ReadWrite")   # least-priv for personal/work OneDrive
 
 # Normalize and split path
 $normPath   = Normalize-OneDrivePath $OneDrivePath
@@ -218,11 +264,13 @@ if ($lastSlash -ge 0) {
   $fileName   = $normPath
 }
 
+if ([string]::IsNullOrWhiteSpace($fileName)) { throw "Target file name resolved empty." }
+
 # Ensure folders exist and get parent item ID
 $parentId    = Ensure-OneDriveFolderPath -FolderPath $parentPath
 $encodedName = [System.Uri]::EscapeDataString($fileName)
 
-# Build ID-based endpoints (wrap vars to avoid colon parsing issues)
+# Build ID-based endpoints
 $sessionUrl  = "https://graph.microsoft.com/v1.0/me/drive/items/$($parentId):/$($encodedName):/createUploadSession"
 $contentUrl  = "https://graph.microsoft.com/v1.0/me/drive/items/$($parentId):/$($encodedName):/content"
 
@@ -249,7 +297,21 @@ catch {
   throw
 }
 finally {
-  if ($ok) { Write-Host "✅ Upload complete: $OneDrivePath" -ForegroundColor Green }
+  if ($ok) {
+    # Verify by path and print a clickable URL
+    $verifyUrl = "https://graph.microsoft.com/v1.0/me/drive/items/$($parentId):/$($encodedName)"
+    try {
+      $finalItem = Invoke-MgGraphRequest -Method GET -Uri $verifyUrl
+      if ($finalItem.webUrl) {
+        Write-Host "✅ Upload complete & verified: $OneDrivePath" -ForegroundColor Green
+        Write-Host "🔗 Open: $($finalItem.webUrl)" -ForegroundColor Cyan
+      } else {
+        Write-Warning "Upload reported success but item wasn't found at expected path (may have been renamed)."
+      }
+    } catch {
+      Write-Warning "Verification GET failed: $($_.Exception.Message)"
+    }
+  }
   Disconnect-MgGraph | Out-Null
   if ($script:HttpClient) { $script:HttpClient.Dispose() ; $script:HttpClient = $null }
 }
