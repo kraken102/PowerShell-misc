@@ -8,7 +8,7 @@
 # ---------------------------------------
 
 # ==== EDIT THESE ====
-$LocalPath    = "C:\*\Backup.rar"       # local file
+$LocalPath    = "C:\*\backup.rar"       # local file
 $OneDrivePath = "Backups\backup.rar"    # OneDrive target path (slashes normalized)
 
 # ==== Safety / logging ====
