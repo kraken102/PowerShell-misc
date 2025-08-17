@@ -1,4 +1,4 @@
 # Misc PowerShell Scripts
 
-A grab-bag of PowerShell scripts I use day to day.  
-They’re not perfect or production-ready — just rough ideas and quick helpers I wrote for myself, shared here in case they’re useful to others.  
+A collection of PowerShell scripts I use on a daily basis.  
+These scripts are provided as reference implementations and may not be fully optimized or production-ready, but are shared in the interest of learning and potential reuse.
